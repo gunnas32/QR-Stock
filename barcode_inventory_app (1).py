@@ -7,9 +7,6 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 import smtplib
 from email.message import EmailMessage
-
-import numpy as np
-import cv2
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
