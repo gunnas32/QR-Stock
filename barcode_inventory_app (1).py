@@ -47,12 +47,21 @@ def generate_qr_images(item_code: str, item_name: str):
     """
     Generate QR code image and labeled image for an item.
     Folder structure: qrcodes/<item_code>/<item_code>.png and <item_code>_label.png
+    Layout: QR on top, text below. Medium size, clear text.
     """
     url = ensure_app_url()
     qr_data = f"{url}?code={item_code}"
 
-    # Base QR
-    qr_img = qrcode.make(qr_data).convert("RGB")
+    # Create QR with a defined size (box_size controls pixel size)
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=4,
+    )
+    qr.add_data(qr_data)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
     # Ensure per-item folder
     item_dir = os.path.join(QRCODE_ROOT_DIR, item_code)
@@ -61,9 +70,9 @@ def generate_qr_images(item_code: str, item_name: str):
     qr_path = os.path.join(item_dir, f"{item_code}.png")
     qr_img.save(qr_path)
 
-    # Labeled QR (QR + text underneath)
+    # Labeled QR (QR + reasonably sized text underneath)
     width, height = qr_img.size
-    label_height = int(height * 0.45)
+    label_height = int(height * 0.45)  # space for 2 lines of text
     total_height = height + label_height
 
     label_img = Image.new("RGB", (width, total_height), "white")
@@ -71,6 +80,7 @@ def generate_qr_images(item_code: str, item_name: str):
 
     draw = ImageDraw.Draw(label_img)
     font = ImageFont.load_default()
+
     text = f"{item_name}\nCode: {item_code}"
 
     # Center multiline text
@@ -173,8 +183,24 @@ def record_transaction(item_code: str, action: str, qty: int, job: str | None = 
     update_excel_report(item_code, action, qty, job, ts)
 
 
+def get_qr_paths(item_code: str, item_name: str):
+    """
+    Ensure QR and label exist for an item, return their paths + data.
+    """
+    item_dir = os.path.join(QRCODE_ROOT_DIR, item_code)
+    qr_path = os.path.join(item_dir, f"{item_code}.png")
+    label_path = os.path.join(item_dir, f"{item_code}_label.png")
+
+    if not os.path.exists(qr_path) or not os.path.exists(label_path):
+        qr_path, label_path, qr_data = generate_qr_images(item_code, item_name)
+    else:
+        qr_data = f"{ensure_app_url()}?code={item_code}"
+
+    return qr_path, label_path, qr_data
+
+
 def show_item_detail(item_code: str, section_title: str = "Item Detail"):
-    """Show item info, stock, history, edit UI, and check in/out controls."""
+    """Show item info, stock, history, edit UI, QR, and check in/out controls."""
     if item_code not in inventory:
         st.error("Item not found.")
         return
@@ -191,6 +217,34 @@ def show_item_detail(item_code: str, section_title: str = "Item Detail"):
         st.write(f"**Item Code:** `{item_code}`")
     with col_top2:
         st.metric("Current Stock", current_qty)
+
+    # --- QR Label & Downloads ---
+    st.write("### QR Label")
+    qr_path, label_path, qr_data = get_qr_paths(item_code, item.get("name", ""))
+
+    if os.path.exists(label_path):
+        st.image(label_path, caption="QR label for this item")
+        col_q1, col_q2 = st.columns(2)
+        with col_q1:
+            with open(qr_path, "rb") as f_qr:
+                st.download_button(
+                    "Download QR only (PNG)",
+                    data=f_qr,
+                    file_name=f"{item_code}_qr.png",
+                    mime="image/png",
+                    key=f"dl_qr_{section_title}_{item_code}",
+                )
+        with col_q2:
+            with open(label_path, "rb") as f_lbl:
+                st.download_button(
+                    "Download QR label (PNG)",
+                    data=f_lbl,
+                    file_name=f"{item_code}_label.png",
+                    mime="image/png",
+                    key=f"dl_label_{section_title}_{item_code}",
+                )
+    else:
+        st.caption("No QR label found for this item.")
 
     # --- Stock Transaction (Check In / Out) ---
     st.write("### Stock Transaction")
@@ -258,8 +312,9 @@ def show_item_detail(item_code: str, section_title: str = "Item Detail"):
             name_changed = (edit_name != item.get("name", ""))
             qty_changed = (edit_qty != current_qty)
 
-            # Handle code change
             new_code = item_code
+
+            # Handle code change
             if code_changed:
                 if edit_code in inventory and edit_code != item_code:
                     st.error(f"Item code '{edit_code}' already exists. Choose another code.")
@@ -278,7 +333,6 @@ def show_item_detail(item_code: str, section_title: str = "Item Detail"):
                 item["quantity"] = int(edit_qty)
                 save_inventory()
                 if diff != 0:
-                    # Record as manual adjustment
                     record_transaction(
                         new_code,
                         "manual",
@@ -434,6 +488,25 @@ if st.button("Create Item & Generate QR Code", type="primary"):
 
         st.success(f"Item '{item_name}' saved with code `{item_code}`. QR code generated.")
         st.image(label_path, caption="QR label for printing")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            with open(qr_path, "rb") as f_qr:
+                st.download_button(
+                    "Download QR only (PNG)",
+                    data=f_qr,
+                    file_name=f"{item_code}_qr.png",
+                    mime="image/png",
+                    key=f"dl_qr_new_{item_code}",
+                )
+        with col_b:
+            with open(label_path, "rb") as f_lbl:
+                st.download_button(
+                    "Download QR label (PNG)",
+                    data=f_lbl,
+                    file_name=f"{item_code}_label.png",
+                    mime="image/png",
+                    key=f"dl_label_new_{item_code}",
+                )
         st.code(qr_data, language="text")
         st.caption("Print this QR label and place it on the item, bin, or shelf.")
 
