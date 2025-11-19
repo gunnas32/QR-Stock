@@ -8,6 +8,8 @@ from datetime import datetime
 # ----------------------
 # Config & Data Storage
 # ----------------------
+APP_BASE_URL = "https://qr-stock-twdxtxesmeefyyewte5uxy.streamlit.app/"
+
 DATA_FILE = "inventory_data.json"
 QRCODE_DIR = "qrcodes"
 os.makedirs(QRCODE_DIR, exist_ok=True)
@@ -68,24 +70,24 @@ def show_item_detail(item_code: str, section_title: str = "Item Detail"):
         action = st.radio(
             "Action",
             ["Check In", "Check Out"],
-            key=f"action_{item_code}"
+            key=f"action_{section_title}_{item_code}"
         )
     with col2:
         qty = st.number_input(
             "Quantity",
             min_value=1,
             step=1,
-            key=f"qty_{item_code}",
+            key=f"qty_{section_title}_{item_code}",
         )
 
     job = None
     if action == "Check Out":
         job = st.text_input(
             "Job / Project (optional, but recommended)",
-            key=f"job_{item_code}"
+            key=f"job_{section_title}_{item_code}"
         )
 
-    if st.button("Save Transaction", key=f"save_{item_code}"):
+    if st.button("Save Transaction", key=f"save_{section_title}_{item_code}"):
         if action == "Check Out" and qty > current_qty:
             st.error("Cannot check out more items than are in stock.")
         else:
@@ -107,9 +109,8 @@ def show_item_detail(item_code: str, section_title: str = "Item Detail"):
     if not history:
         st.info("No transactions recorded yet.")
     else:
-        # Show most recent first
         rows = []
-        for entry in reversed(history):
+        for entry in reversed(history):  # most recent first
             rows.append({
                 "Time": entry.get("timestamp", ""),
                 "Action": "IN" if entry.get("action") == "in" else "OUT",
@@ -131,58 +132,55 @@ st.caption("Scan QR codes to check items in/out and track stock levels.")
 # 1. Detect if we were opened via QR code (?code=...)
 # ---------------------------------------------------
 scanned_code = None
-qp = st.query_params  # Streamlit 1.30+ API
+qp = st.query_params  # Streamlit 1.30+ style API
 
 if "code" in qp and qp["code"]:
-    scanned_code = qp["code"]
+    val = qp["code"]
+    if isinstance(val, list):
+        scanned_code = val[0]
+    else:
+        scanned_code = val
 
 # ---------------------------------------------------
 # 2. Inventory Search / Home Section
 # ---------------------------------------------------
 st.markdown("## 🔍 Search Inventory")
 
+selected_code = None
+
 if not inventory:
     st.info("No items in inventory yet. Use the **Admin – Create New Item** section below to add items.")
 else:
-    search = st.text_input("Search by item name or code")
-    # Build list of (label, code)
+    # Build list of labels
     items = []
     for code, item in sorted(inventory.items(), key=lambda x: x[1].get("name", "").lower()):
         label = f"{item.get('name','')} ({code})"
         items.append((label, code))
 
-    # Filter items based on search text
-    if search:
-        search_lower = search.lower()
-        filtered = [
-            (label, code)
-            for (label, code) in items
-            if search_lower in label.lower()
-        ]
-    else:
-        filtered = items
+    labels = [label for (label, _) in items]
+    labels_by_code = {label: code for (label, code) in items}
 
-    if not filtered:
-        st.warning("No items match your search.")
-    else:
-        labels = [label for (label, _) in filtered]
-        default_index = 0
-        selected_label = st.selectbox(
-            "Select an item to view stock and history",
-            labels,
-            index=default_index,
-        )
-        # Get the code back from label
-        selected_code = dict(filtered)[selected_label]
+    placeholder = "[Select item]"
+    ui_options = [placeholder] + labels
 
-        show_item_detail(selected_code, section_title="Selected Item")
+    selected_label = st.selectbox(
+        "Search / Select item",
+        ui_options,
+        index=0,
+    )
+
+    if selected_label != placeholder:
+        selected_code = labels_by_code[selected_label]
+
+# Show selected item detail ONLY when not opened via QR
+if selected_code and not scanned_code:
+    show_item_detail(selected_code, section_title="Selected Item")
 
 # ---------------------------------------------------
 # 3. If opened via QR scan, show scanned item section
 # ---------------------------------------------------
 if scanned_code:
     show_item_detail(scanned_code, section_title="Scanned Item")
-
 
 # ---------------------------------------------------
 # 4. Admin Section – Create Items & Generate QR Codes
@@ -195,11 +193,8 @@ st.info(
     "Workers can then scan the QR codes with their phones."
 )
 
-# Public URL needed so QR codes link back correctly
-base_url = st.text_input(
-    "Public App URL (for QR code links)",
-    help="Example: https://your-app-name.streamlit.app/",
-)
+st.write("### App URL used for QR codes")
+st.code(APP_BASE_URL, language="text")
 
 item_name = st.text_input("Item Name")
 item_code_input = st.text_input("Item Code (optional – leave blank to auto-generate)")
@@ -207,13 +202,9 @@ item_code_input = st.text_input("Item Code (optional – leave blank to auto-gen
 if st.button("Create Item & Generate QR Code", type="primary"):
     if not item_name:
         st.error("Please enter an item name.")
-    elif not base_url:
-        st.error("Please enter the public URL of this app so QR codes can link back to it.")
     else:
-        # Use existing code if supplied, else auto-generate
         item_code = item_code_input.strip() or str(uuid.uuid4())[:8]
 
-        # If item already exists, don't overwrite unless it's intentional
         if item_code in inventory:
             st.warning(f"Item code '{item_code}' already exists. Using existing item.")
         else:
@@ -224,8 +215,8 @@ if st.button("Create Item & Generate QR Code", type="primary"):
             }
             save_inventory()
 
-        # Ensure base_url ends with '/'
-        url = base_url.strip()
+        # Ensure URL ends with '/'
+        url = APP_BASE_URL.strip()
         if not url.endswith("/"):
             url += "/"
 
