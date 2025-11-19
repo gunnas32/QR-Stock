@@ -4,6 +4,8 @@ import qrcode
 import os
 import json
 from datetime import datetime
+from openpyxl import Workbook, load_workbook
+from PIL import Image, ImageDraw, ImageFont
 
 # ----------------------
 # Config & Data Storage
@@ -11,8 +13,11 @@ from datetime import datetime
 APP_BASE_URL = "https://qr-stock-twdxtxesmeefyyewte5uxy.streamlit.app/"
 
 DATA_FILE = "inventory_data.json"
-QRCODE_DIR = "qrcodes"
-os.makedirs(QRCODE_DIR, exist_ok=True)
+QRCODE_ROOT_DIR = "qrcodes"
+REPORTS_DIR = "reports"
+
+os.makedirs(QRCODE_ROOT_DIR, exist_ok=True)
+os.makedirs(REPORTS_DIR, exist_ok=True)
 
 # Load inventory from JSON
 if os.path.exists(DATA_FILE):
@@ -29,13 +34,134 @@ def save_inventory():
 
 
 # ----------------------
-# Helper Functions
+# QR Code Helpers
+# ----------------------
+def ensure_app_url() -> str:
+    url = APP_BASE_URL.strip()
+    if not url.endswith("/"):
+        url += "/"
+    return url
+
+
+def generate_qr_images(item_code: str, item_name: str):
+    """
+    Generate QR code image and labeled image for an item.
+    Folder structure: qrcodes/<item_code>/<item_code>.png and <item_code>_label.png
+    """
+    url = ensure_app_url()
+    qr_data = f"{url}?code={item_code}"
+
+    # Base QR
+    qr_img = qrcode.make(qr_data).convert("RGB")
+
+    # Ensure per-item folder
+    item_dir = os.path.join(QRCODE_ROOT_DIR, item_code)
+    os.makedirs(item_dir, exist_ok=True)
+
+    qr_path = os.path.join(item_dir, f"{item_code}.png")
+    qr_img.save(qr_path)
+
+    # Labeled QR (QR + text underneath)
+    width, height = qr_img.size
+    label_height = int(height * 0.45)
+    total_height = height + label_height
+
+    label_img = Image.new("RGB", (width, total_height), "white")
+    label_img.paste(qr_img, (0, 0))
+
+    draw = ImageDraw.Draw(label_img)
+    font = ImageFont.load_default()
+    text = f"{item_name}\nCode: {item_code}"
+
+    # Center multiline text
+    try:
+        bbox = draw.multiline_textbbox((0, 0), text, font=font, align="center")
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+    except AttributeError:
+        # Fallback if older Pillow: rough size estimation
+        lines = text.split("\n")
+        text_w = max(draw.textlength(line, font=font) for line in lines)
+        text_h = len(lines) * (font.size + 4)
+
+    x = (width - text_w) // 2
+    y = height + (label_height - text_h) // 2
+
+    draw.multiline_text((x, y), text, fill="black", font=font, align="center")
+
+    label_path = os.path.join(item_dir, f"{item_code}_label.png")
+    label_img.save(label_path)
+
+    return qr_path, label_path, qr_data
+
+
+# ----------------------
+# Excel Reporting Helpers
+# ----------------------
+def get_today_report_path() -> str:
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(REPORTS_DIR, f"{date_str}_report.xlsx")
+
+
+def update_excel_report(item_code: str, action: str, qty: int, job: str | None, ts: str):
+    """
+    Update (or create) today's Excel report.
+    Sheet 1: Transactions
+    Sheet 2: Stock
+    """
+    report_path = get_today_report_path()
+    if os.path.exists(report_path):
+        wb = load_workbook(report_path)
+    else:
+        wb = Workbook()
+        ws1 = wb.active
+        ws1.title = "Transactions"
+        ws1.append(["Time", "Item", "Code", "Action", "Qty", "Job"])
+        wb.create_sheet("Stock")
+
+    # Transactions sheet
+    ws_tx = wb["Transactions"]
+    item = inventory[item_code]
+    action_label = {
+        "in": "IN",
+        "out": "OUT",
+        "manual": "MANUAL",
+    }.get(action, action.upper())
+
+    ws_tx.append([
+        ts,
+        item.get("name", ""),
+        item_code,
+        action_label,
+        int(qty),
+        job or "",
+    ])
+
+    # Rebuild Stock sheet each time to keep it accurate
+    if "Stock" in wb.sheetnames:
+        ws_stock = wb["Stock"]
+        wb.remove(ws_stock)
+    ws_stock = wb.create_sheet("Stock")
+    ws_stock.append(["Item", "Code", "Quantity"])
+
+    for code, it in inventory.items():
+        ws_stock.append([
+            it.get("name", ""),
+            code,
+            int(it.get("quantity", 0)),
+        ])
+
+    wb.save(report_path)
+
+
+# ----------------------
+# Transactions & Item Detail
 # ----------------------
 def record_transaction(item_code: str, action: str, qty: int, job: str | None = None):
-    """Add a transaction entry to an item, with timestamp."""
+    """Add a transaction entry to an item, with timestamp and Excel update."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = {
-        "action": action,  # "in" or "out"
+        "action": action,  # "in", "out", or "manual"
         "qty": int(qty),
         "timestamp": ts,
     }
@@ -44,27 +170,30 @@ def record_transaction(item_code: str, action: str, qty: int, job: str | None = 
 
     inventory[item_code].setdefault("history", []).append(entry)
     save_inventory()
+    update_excel_report(item_code, action, qty, job, ts)
 
 
 def show_item_detail(item_code: str, section_title: str = "Item Detail"):
-    """Show item info, stock, history, and check in/out controls."""
+    """Show item info, stock, history, edit UI, and check in/out controls."""
     if item_code not in inventory:
         st.error("Item not found.")
         return
 
     item = inventory[item_code]
-
     st.markdown("---")
     st.subheader(section_title)
-    st.write(f"**Item Name:** {item.get('name', '')}")
-    st.write(f"**Item Code:** `{item_code}`")
 
     current_qty = int(item.get("quantity", 0))
-    st.metric("Current Stock", current_qty)
 
-    # --- Check In / Check Out Form ---
+    col_top1, col_top2 = st.columns([2, 1])
+    with col_top1:
+        st.write(f"**Item Name:** {item.get('name', '')}")
+        st.write(f"**Item Code:** `{item_code}`")
+    with col_top2:
+        st.metric("Current Stock", current_qty)
+
+    # --- Stock Transaction (Check In / Out) ---
     st.write("### Stock Transaction")
-
     col1, col2 = st.columns(2)
     with col1:
         action = st.radio(
@@ -93,18 +222,84 @@ def show_item_detail(item_code: str, section_title: str = "Item Detail"):
         else:
             if action == "Check In":
                 inventory[item_code]["quantity"] = current_qty + int(qty)
+                save_inventory()
                 record_transaction(item_code, "in", qty)
                 st.success(f"Checked IN {qty} item(s).")
             else:
                 inventory[item_code]["quantity"] = current_qty - int(qty)
+                save_inventory()
                 record_transaction(item_code, "out", qty, job)
                 st.success(f"Checked OUT {qty} item(s).")
 
             st.rerun()
 
+    # --- Edit Item Details ---
+    with st.expander("✏️ Edit Item Details"):
+        edit_name = st.text_input(
+            "Item Name",
+            value=item.get("name", ""),
+            key=f"edit_name_{section_title}_{item_code}",
+        )
+        edit_code = st.text_input(
+            "Item Code",
+            value=item_code,
+            key=f"edit_code_{section_title}_{item_code}",
+        )
+        edit_qty = st.number_input(
+            "Quantity (manual override)",
+            min_value=0,
+            value=current_qty,
+            step=1,
+            key=f"edit_qty_{section_title}_{item_code}",
+        )
+
+        if st.button("Save Item Changes", key=f"edit_save_{section_title}_{item_code}"):
+            code_changed = (edit_code != item_code)
+            name_changed = (edit_name != item.get("name", ""))
+            qty_changed = (edit_qty != current_qty)
+
+            # Handle code change
+            new_code = item_code
+            if code_changed:
+                if edit_code in inventory and edit_code != item_code:
+                    st.error(f"Item code '{edit_code}' already exists. Choose another code.")
+                    return
+                new_code = edit_code
+                inventory[new_code] = inventory.pop(item_code)
+                item = inventory[new_code]  # update ref
+
+            # Handle name change
+            if name_changed:
+                item["name"] = edit_name
+
+            # Handle quantity change as MANUAL transaction
+            if qty_changed:
+                diff = int(edit_qty) - current_qty
+                item["quantity"] = int(edit_qty)
+                save_inventory()
+                if diff != 0:
+                    # Record as manual adjustment
+                    record_transaction(
+                        new_code,
+                        "manual",
+                        abs(diff),
+                        job=f"Manual adjust from {current_qty} to {edit_qty}",
+                    )
+
+            save_inventory()
+
+            # Regenerate QR images if name or code changed
+            if code_changed or name_changed:
+                qr_path, label_path, qr_data = generate_qr_images(new_code, edit_name)
+                st.success("Item details updated and QR label regenerated.")
+                st.image(label_path, caption="Updated QR label")
+            else:
+                st.success("Item details updated.")
+
+            st.rerun()
+
     # --- Transaction History ---
     st.write("### Transaction History")
-
     history = inventory[item_code].get("history", [])
     if not history:
         st.info("No transactions recorded yet.")
@@ -113,7 +308,11 @@ def show_item_detail(item_code: str, section_title: str = "Item Detail"):
         for entry in reversed(history):  # most recent first
             rows.append({
                 "Time": entry.get("timestamp", ""),
-                "Action": "IN" if entry.get("action") == "in" else "OUT",
+                "Action": {
+                    "in": "IN",
+                    "out": "OUT",
+                    "manual": "MANUAL",
+                }.get(entry.get("action"), entry.get("action", "").upper()),
                 "Qty": entry.get("qty", 0),
                 "Job": entry.get("job", ""),
             })
@@ -129,7 +328,24 @@ st.title("📦 QR Stock – Inventory System")
 st.caption("Scan QR codes to check items in/out and track stock levels.")
 
 # ---------------------------------------------------
-# 1. Detect if we were opened via QR code (?code=...)
+# 1. Daily Excel Report Download (Home)
+# ---------------------------------------------------
+st.markdown("### 📄 Daily Excel Report")
+today_report = get_today_report_path()
+if os.path.exists(today_report):
+    with open(today_report, "rb") as f:
+        st.download_button(
+            "Download Today's Report (Excel)",
+            data=f,
+            file_name=os.path.basename(today_report),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_report_home",
+        )
+else:
+    st.caption("No transactions recorded today yet.")
+
+# ---------------------------------------------------
+# 2. Detect if we were opened via QR code (?code=...)
 # ---------------------------------------------------
 scanned_code = None
 qp = st.query_params  # Streamlit 1.30+ style API
@@ -142,7 +358,7 @@ if "code" in qp and qp["code"]:
         scanned_code = val
 
 # ---------------------------------------------------
-# 2. Inventory Search / Home Section
+# 3. Inventory Search / Home Section
 # ---------------------------------------------------
 st.markdown("## 🔍 Search Inventory")
 
@@ -151,10 +367,9 @@ selected_code = None
 if not inventory:
     st.info("No items in inventory yet. Use the **Admin – Create New Item** section below to add items.")
 else:
-    # Build list of labels
     items = []
-    for code, item in sorted(inventory.items(), key=lambda x: x[1].get("name", "").lower()):
-        label = f"{item.get('name','')} ({code})"
+    for code, it in sorted(inventory.items(), key=lambda x: x[1].get("name", "").lower()):
+        label = f"{it.get('name','')} ({code})"
         items.append((label, code))
 
     labels = [label for (label, _) in items]
@@ -177,13 +392,13 @@ if selected_code and not scanned_code:
     show_item_detail(selected_code, section_title="Selected Item")
 
 # ---------------------------------------------------
-# 3. If opened via QR scan, show scanned item section
+# 4. If opened via QR scan, show scanned item section
 # ---------------------------------------------------
 if scanned_code:
     show_item_detail(scanned_code, section_title="Scanned Item")
 
 # ---------------------------------------------------
-# 4. Admin Section – Create Items & Generate QR Codes
+# 5. Admin Section – Create Items & Generate QR Codes
 # ---------------------------------------------------
 st.markdown("---")
 st.markdown("## 🛠️ Admin – Create New Item & QR Code")
@@ -194,10 +409,10 @@ st.info(
 )
 
 st.write("### App URL used for QR codes")
-st.code(APP_BASE_URL, language="text")
+st.code(ensure_app_url(), language="text")
 
-item_name = st.text_input("Item Name")
-item_code_input = st.text_input("Item Code (optional – leave blank to auto-generate)")
+item_name = st.text_input("New Item Name")
+item_code_input = st.text_input("New Item Code (optional – leave blank to auto-generate)")
 
 if st.button("Create Item & Generate QR Code", type="primary"):
     if not item_name:
@@ -215,17 +430,25 @@ if st.button("Create Item & Generate QR Code", type="primary"):
             }
             save_inventory()
 
-        # Ensure URL ends with '/'
-        url = APP_BASE_URL.strip()
-        if not url.endswith("/"):
-            url += "/"
-
-        qr_data = f"{url}?code={item_code}"
-        img = qrcode.make(qr_data)
-        filepath = os.path.join(QRCODE_DIR, f"{item_code}.png")
-        img.save(filepath)
+        qr_path, label_path, qr_data = generate_qr_images(item_code, item_name)
 
         st.success(f"Item '{item_name}' saved with code `{item_code}`. QR code generated.")
-        st.image(filepath, caption="QR code for this item")
+        st.image(label_path, caption="QR label for printing")
         st.code(qr_data, language="text")
-        st.caption("Print this QR code and place it on the item, bin, or shelf.")
+        st.caption("Print this QR label and place it on the item, bin, or shelf.")
+
+# ---------------------------------------------------
+# 6. Admin – Daily Excel Report Download (duplicate, per your request)
+# ---------------------------------------------------
+st.markdown("### 📄 Daily Excel Report (Admin)")
+if os.path.exists(today_report):
+    with open(today_report, "rb") as f:
+        st.download_button(
+            "Download Today's Report (Excel)",
+            data=f,
+            file_name=os.path.basename(today_report),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_report_admin",
+        )
+else:
+    st.caption("No transactions recorded today yet.")
