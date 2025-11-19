@@ -7,12 +7,11 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 import smtplib
 from email.message import EmailMessage
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 from PIL import Image, ImageDraw, ImageFont
-from pyzbar.pyzbar import decode as qr_decode
-from PIL import Image
 
 # ----------------------
 # Config & Paths
@@ -62,9 +61,11 @@ def ensure_app_url() -> str:
 
 def generate_qr_images(item_code: str, part_name: str):
     """
-    Generate QR code + labeled QR image for an item.
-    qrcodes/<item_code>/<item_code>.png
-    qrcodes/<item_code>/<item_code>_label.png
+    Generate QR code + labeled QR image for a part.
+    Folder: qrcodes/<item_code>/
+      - <item_code>.png
+      - <item_code>_label.png
+
     Label shows:
       line 1: Part number or name
       line 2: Description: <code>
@@ -100,7 +101,7 @@ def generate_qr_images(item_code: str, part_name: str):
 
     # Try larger TrueType font, fall back to default
     try:
-        font = ImageFont.truetype("arial.ttf", size=26)
+        font = ImageFont.truetype("arial.ttf", size=28)
     except Exception:
         font = ImageFont.load_default()
 
@@ -127,7 +128,7 @@ def generate_qr_images(item_code: str, part_name: str):
 
 
 def get_qr_paths(item_code: str, part_name: str):
-    """Ensure QR + label exist for an item."""
+    """Ensure QR + label exist for a part."""
     item_dir = os.path.join(QRCODE_ROOT_DIR, item_code)
     qr_path = os.path.join(item_dir, f"{item_code}.png")
     label_path = os.path.join(item_dir, f"{item_code}_label.png")
@@ -138,38 +139,6 @@ def get_qr_paths(item_code: str, part_name: str):
         qr_data = f"{ensure_app_url()}?code={item_code}"
 
     return qr_path, label_path, qr_data
-
-
-
-def decode_qr_from_image(uploaded_image) -> str | None:
-    """Decode QR code using pyzbar (Streamlit Cloud compatible, no OpenCV)."""
-    if uploaded_image is None:
-        return None
-    try:
-        img = Image.open(uploaded_image)
-        decoded = qr_decode(img)
-        if not decoded:
-            return None
-        return decoded[0].data.decode("utf-8")
-    except Exception:
-        return None
-
-
-
-def extract_code_from_qr_data(data: str) -> str | None:
-    """
-    Expect data to be a URL containing ?code=XYZ, but if it's just a code, use as-is.
-    """
-    if not data:
-        return None
-    if "?" not in data:
-        return data.strip()
-    parsed = urlparse(data)
-    qs = parse_qs(parsed.query)
-    codes = qs.get("code")
-    if codes:
-        return codes[0]
-    return None
 
 
 # ----------------------
@@ -255,8 +224,7 @@ def format_stock_sheet(ws):
     for row in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col):
         for cell in row:
             cell.border = thin
-            if cell.column in (1, 2, 3):
-                cell.alignment = center
+            cell.alignment = center
 
 
 def update_excel_report(
@@ -296,7 +264,7 @@ def update_excel_report(
     ws_tx.append([
         ts,
         item.get("name", ""),      # Part number or name
-        item_code,                 # Description label
+        item_code,                 # Description
         action_label,
         int(qty),
         person or "",
@@ -384,7 +352,6 @@ def maybe_send_stock_alert(item_code: str, old_qty: int, new_qty: int):
             current_qty=new_qty,
             threshold=threshold,
         )
-        # Track last alert level
         item["last_alert_level"] = new_qty
         save_inventory()
 
@@ -450,7 +417,7 @@ def show_item_view(item_code: str, header_title: str, transactions_only: bool = 
         )
 
     # ------------------- TRANSACTION BLOCK (shared) -------------------
-    def render_transaction_block(show_scan_again: bool):
+    def render_transaction_block(show_scan_hint: bool):
         st.markdown("##### Transaction")
 
         col_tx1, col_tx2 = st.columns(2)
@@ -489,71 +456,56 @@ def show_item_view(item_code: str, header_title: str, transactions_only: bool = 
         )
 
         st.markdown("")
-        tx_col1, tx_col2 = st.columns([2, 1])
-        with tx_col1:
-            if st.button("Apply Transaction", type="primary", key=f"tx_save_{item_code}"):
-                if not person.strip():
-                    st.error("Please enter the person name.")
+        if st.button("Apply Transaction", type="primary", key=f"tx_save_{item_code}"):
+            if not person.strip():
+                st.error("Please enter the person name.")
+                return
+
+            old_qty = qty_current
+            if action == "Check In":
+                new_qty = qty_current + int(qty)
+                inventory[item_code]["quantity"] = new_qty
+                save_inventory()
+                record_transaction(
+                    item_code,
+                    "in",
+                    qty,
+                    person=person.strip(),
+                    job=None,
+                    notes=notes.strip() if notes else None,
+                )
+                maybe_send_stock_alert(item_code, old_qty, new_qty)
+                st.success(f"Checked IN {qty} item(s).")
+            else:
+                if qty > qty_current:
+                    st.error("Cannot check out more items than are in stock.")
                     return
+                new_qty = qty_current - int(qty)
+                inventory[item_code]["quantity"] = new_qty
+                save_inventory()
+                record_transaction(
+                    item_code,
+                    "out",
+                    qty,
+                    person=person.strip(),
+                    job=job.strip() if job else None,
+                    notes=notes.strip() if notes else None,
+                )
+                maybe_send_stock_alert(item_code, old_qty, new_qty)
+                st.success(f"Checked OUT {qty} item(s).")
 
-                old_qty = qty_current
-                if action == "Check In":
-                    new_qty = qty_current + int(qty)
-                    inventory[item_code]["quantity"] = new_qty
-                    save_inventory()
-                    record_transaction(
-                        item_code,
-                        "in",
-                        qty,
-                        person=person.strip(),
-                        job=None,
-                        notes=notes.strip() if notes else None,
-                    )
-                    maybe_send_stock_alert(item_code, old_qty, new_qty)
-                    st.success(f"Checked IN {qty} item(s).")
-                else:
-                    if qty > qty_current:
-                        st.error("Cannot check out more items than are in stock.")
-                        return
-                    new_qty = qty_current - int(qty)
-                    inventory[item_code]["quantity"] = new_qty
-                    save_inventory()
-                    record_transaction(
-                        item_code,
-                        "out",
-                        qty,
-                        person=person.strip(),
-                        job=job.strip() if job else None,
-                        notes=notes.strip() if notes else None,
-                    )
-                    maybe_send_stock_alert(item_code, old_qty, new_qty)
-                    st.success(f"Checked OUT {qty} item(s).")
+            st.rerun()
 
-                st.rerun()
-
-        if show_scan_again:
-            with tx_col2:
-                if st.button("📷 Scan another item", key=f"scan_again_{item_code}"):
-                    st.session_state["scan_again"] = True
-
-            if st.session_state.get("scan_again"):
-                st.markdown("#### Scan another item")
-                cam_image = st.camera_input("Scan QR code of next item")
-                if cam_image is not None:
-                    data = decode_qr_from_image(cam_image)
-                    code = extract_code_from_qr_data(data) if data else None
-                    if code and code in inventory:
-                        st.session_state["camera_item_code"] = code
-                        st.session_state["scan_again"] = False
-                        st.rerun()
-                    elif code:
-                        st.error(f"Scanned code '{code}' not found in inventory.")
-                    else:
-                        st.error("Could not read QR code from the image. Try again.")
+        if show_scan_hint:
+            st.markdown("---")
+            st.markdown(
+                "To scan another part, use your phone's **camera app** again and scan the "
+                "next QR label. It will open this page for that part."
+            )
 
     # ------------------- MODE: TRANSACTIONS ONLY (QR SCAN) -------------------
     if transactions_only:
-        render_transaction_block(show_scan_again=True)
+        render_transaction_block(show_scan_hint=True)
         return
 
     # ------------------- FULL TABS VIEW (DESKTOP) -------------------
@@ -563,7 +515,7 @@ def show_item_view(item_code: str, header_title: str, transactions_only: bool = 
 
     # Transaction tab
     with tab_tx:
-        render_transaction_block(show_scan_again=False)
+        render_transaction_block(show_scan_hint=False)
 
     # History tab
     with tab_hist:
@@ -645,7 +597,7 @@ def show_item_view(item_code: str, header_title: str, transactions_only: bool = 
             # Code change
             if code_changed:
                 if edit_code in inventory and edit_code != item_code:
-                    st.error(f"Description/code '{edit_code}' already exists. Choose another.")
+                    st.error(f"Description '{edit_code}' already exists. Choose another.")
                     return
                 new_code = edit_code
                 inventory[new_code] = inventory.pop(item_code)
@@ -797,7 +749,7 @@ if page == "Home":
     st.markdown(
         "- Use **Admin** to create parts and generate QR labels.\n"
         "- Attach QR labels to shelves, bins, tools, or parts.\n"
-        "- Workers scan QR with phone camera to open the **Item** page in transaction-only mode.\n"
+        "- Workers scan QR with the phone's camera app to open the **Item** page in transaction-only mode.\n"
         "- Use the transaction form to check stock in or out (with person, job, notes).\n"
         "- All movements and overrides are logged into the Excel report.\n"
     )
@@ -813,14 +765,10 @@ elif page == "Item":
 
     # QR-scan case: only allow transactions (phone)
     if scanned_code:
-        # If user already scanned another item using camera, override
-        camera_code = st.session_state.get("camera_item_code")
-        effective_code = camera_code or scanned_code
-
-        if effective_code in inventory:
-            item_to_show = effective_code
+        if scanned_code in inventory:
+            item_to_show = scanned_code
             transactions_only = True
-            st.caption(f"Loaded via QR scan. Mode: transactions only.")
+            st.caption("Loaded via QR scan. Mode: transactions only.")
         else:
             st.error("Scanned code not found in inventory.")
 
