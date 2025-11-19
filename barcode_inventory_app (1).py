@@ -11,6 +11,8 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 from PIL import Image, ImageDraw, ImageFont
+from pyzbar.pyzbar import decode as qr_decode
+from PIL import Image
 
 # ----------------------
 # Config & Paths
@@ -138,19 +140,20 @@ def get_qr_paths(item_code: str, part_name: str):
     return qr_path, label_path, qr_data
 
 
+
 def decode_qr_from_image(uploaded_image) -> str | None:
-    """Decode QR code content from an image captured with st.camera_input."""
+    """Decode QR code using pyzbar (Streamlit Cloud compatible, no OpenCV)."""
     if uploaded_image is None:
         return None
-    file_bytes = np.frombuffer(uploaded_image.getvalue(), np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    if img is None:
+    try:
+        img = Image.open(uploaded_image)
+        decoded = qr_decode(img)
+        if not decoded:
+            return None
+        return decoded[0].data.decode("utf-8")
+    except Exception:
         return None
-    detector = cv2.QRCodeDetector()
-    data, points, _ = detector.detectAndDecode(img)
-    if not data:
-        return None
-    return data
+
 
 
 def extract_code_from_qr_data(data: str) -> str | None:
