@@ -15,9 +15,11 @@ APP_BASE_URL = "https://qr-stock-twdxtxesmeefyyewte5uxy.streamlit.app/"
 DATA_FILE = "inventory_data.json"
 QRCODE_ROOT_DIR = "qrcodes"
 REPORTS_DIR = "reports"
+REPORT_FILE_NAME = "inventory_report.xlsx"
 
 os.makedirs(QRCODE_ROOT_DIR, exist_ok=True)
 os.makedirs(REPORTS_DIR, exist_ok=True)
+
 
 # ----------------------
 # Load / Save Inventory
@@ -69,16 +71,22 @@ def generate_qr_images(item_code: str, item_name: str):
     qr_path = os.path.join(item_dir, f"{item_code}.png")
     qr_img.save(qr_path)
 
-    # Label: QR + text below
+    # Label: QR + larger text below
     width, height = qr_img.size
-    label_height = int(height * 0.45)
+    label_height = int(height * 0.6)  # more room for bigger text
     total_height = height + label_height
 
     label_img = Image.new("RGB", (width, total_height), "white")
     label_img.paste(qr_img, (0, 0))
 
     draw = ImageDraw.Draw(label_img)
-    font = ImageFont.load_default()
+
+    # Try larger TrueType font, fall back to default
+    try:
+        font = ImageFont.truetype("arial.ttf", size=24)
+    except Exception:
+        font = ImageFont.load_default()
+
     text = f"{item_name}\nCode: {item_code}"
 
     try:
@@ -88,10 +96,11 @@ def generate_qr_images(item_code: str, item_name: str):
     except AttributeError:
         lines = text.split("\n")
         text_w = max(draw.textlength(line, font=font) for line in lines)
-        text_h = len(lines) * (font.size + 4)
+        text_h = len(lines) * (font.size + 6)
 
     x = (width - text_w) // 2
     y = height + (label_height - text_h) // 2
+
     draw.multiline_text((x, y), text, fill="black", font=font, align="center")
 
     label_path = os.path.join(item_dir, f"{item_code}_label.png")
@@ -117,18 +126,25 @@ def get_qr_paths(item_code: str, item_name: str):
 # ----------------------
 # Excel Reporting
 # ----------------------
-def get_today_report_path() -> str:
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    return os.path.join(REPORTS_DIR, f"{date_str}_report.xlsx")
+def get_report_path() -> str:
+    return os.path.join(REPORTS_DIR, REPORT_FILE_NAME)
 
 
-def update_excel_report(item_code: str, action: str, qty: int, job: str | None, ts: str):
+def update_excel_report(
+    item_code: str,
+    action: str,
+    qty: int,
+    person: str | None,
+    job: str | None,
+    notes: str | None,
+    ts: str,
+):
     """
-    Update (or create) today's Excel report.
-    Sheet 1: Transactions
-    Sheet 2: Stock
+    Update (or create) the cumulative inventory_report.xlsx.
+    Sheet 1: Transactions (all-time)
+    Sheet 2: Stock (current)
     """
-    report_path = get_today_report_path()
+    report_path = get_report_path()
 
     if os.path.exists(report_path):
         wb = load_workbook(report_path)
@@ -136,7 +152,7 @@ def update_excel_report(item_code: str, action: str, qty: int, job: str | None, 
         wb = Workbook()
         ws1 = wb.active
         ws1.title = "Transactions"
-        ws1.append(["Time", "Item", "Code", "Action", "Qty", "Job"])
+        ws1.append(["Time", "Item", "Code", "Action", "Qty", "Person", "Job", "Notes"])
         wb.create_sheet("Stock")
 
     ws_tx = wb["Transactions"]
@@ -154,10 +170,12 @@ def update_excel_report(item_code: str, action: str, qty: int, job: str | None, 
         item_code,
         action_label,
         int(qty),
+        person or "",
         job or "",
+        notes or "",
     ])
 
-    # Rebuild Stock sheet for accuracy
+    # Rebuild Stock sheet each time for up-to-date view
     if "Stock" in wb.sheetnames:
         ws_stock = wb["Stock"]
         wb.remove(ws_stock)
@@ -178,24 +196,39 @@ def update_excel_report(item_code: str, action: str, qty: int, job: str | None, 
 # ----------------------
 # Transactions & Item Logic
 # ----------------------
-def record_transaction(item_code: str, action: str, qty: int, job: str | None = None):
-    """Record transaction + update Excel."""
+def record_transaction(
+    item_code: str,
+    action: str,
+    qty: int,
+    person: str | None = None,
+    job: str | None = None,
+    notes: str | None = None,
+):
+    """Record transaction in JSON + Excel."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = {
         "action": action,
         "qty": int(qty),
         "timestamp": ts,
     }
+    if person:
+        entry["person"] = person
     if job:
         entry["job"] = job
+    if notes:
+        entry["notes"] = notes
 
     inventory[item_code].setdefault("history", []).append(entry)
     save_inventory()
-    update_excel_report(item_code, action, qty, job, ts)
+    update_excel_report(item_code, action, qty, person, job, notes, ts)
 
 
-def show_item_view(item_code: str, header_title: str):
-    """Item page with sub-tabs: Transaction, History, Edit, QR."""
+def show_item_view(item_code: str, header_title: str, transactions_only: bool = False):
+    """
+    Main item view.
+    - If transactions_only=True: show only the Transaction UI (QR-scan mode).
+    - Otherwise: show full tabs (Transaction, History, Edit, QR).
+    """
     if item_code not in inventory:
         st.error("Item not found.")
         return
@@ -206,7 +239,7 @@ def show_item_view(item_code: str, header_title: str):
 
     st.subheader(header_title)
 
-    # Simple header with stock
+    # Header with stock
     header_col1, header_col2 = st.columns([3, 1])
     with header_col1:
         st.markdown(f"**Item:** {item_name}")
@@ -220,57 +253,96 @@ def show_item_view(item_code: str, header_title: str):
             unsafe_allow_html=True,
         )
 
+    # ------------------- TRANSACTION BLOCK (shared) -------------------
+    def render_transaction_block():
+        st.markdown("##### Transaction")
+
+        col_tx1, col_tx2 = st.columns(2)
+        with col_tx1:
+            action = st.selectbox(
+                "Action",
+                ["Check In", "Check Out"],
+                key=f"tx_action_{item_code}",
+            )
+        with col_tx2:
+            qty = st.number_input(
+                "Quantity",
+                min_value=1,
+                step=1,
+                key=f"tx_qty_{item_code}",
+            )
+
+        col_tx3, col_tx4 = st.columns(2)
+        with col_tx3:
+            person = st.text_input(
+                "Person",
+                key=f"tx_person_{item_code}",
+            )
+        with col_tx4:
+            job = None
+            if action == "Check Out":
+                job = st.text_input(
+                    "Job / Project",
+                    key=f"tx_job_{item_code}",
+                )
+
+        notes = st.text_area(
+            "Notes (optional)",
+            key=f"tx_notes_{item_code}",
+            height=60,
+        )
+
+        st.markdown("")
+        if st.button("Apply Transaction", type="primary", key=f"tx_save_{item_code}"):
+            if not person.strip():
+                st.error("Please enter the person name.")
+                return
+
+            if action == "Check Out" and qty > qty_current:
+                st.error("Cannot check out more items than are in stock.")
+            else:
+                if action == "Check In":
+                    inventory[item_code]["quantity"] = qty_current + int(qty)
+                    save_inventory()
+                    record_transaction(
+                        item_code,
+                        "in",
+                        qty,
+                        person=person.strip(),
+                        job=None,
+                        notes=notes.strip() if notes else None,
+                    )
+                    st.success(f"Checked IN {qty} item(s).")
+                else:
+                    inventory[item_code]["quantity"] = qty_current - int(qty)
+                    save_inventory()
+                    record_transaction(
+                        item_code,
+                        "out",
+                        qty,
+                        person=person.strip(),
+                        job=job.strip() if job else None,
+                        notes=notes.strip() if notes else None,
+                    )
+                    st.success(f"Checked OUT {qty} item(s).")
+
+                st.rerun()
+
+    # ------------------- MODE: TRANSACTIONS ONLY (QR SCAN) -------------------
+    if transactions_only:
+        render_transaction_block()
+        return
+
+    # ------------------- FULL TABS VIEW -------------------
     tab_tx, tab_hist, tab_edit, tab_qr = st.tabs(
         ["💼 Transaction", "📜 History", "✏️ Edit", "🖨️ QR Code"]
     )
 
-    # ------------- Transaction Tab -------------
+    # Transaction tab
     with tab_tx:
-        st.markdown("##### Transaction")
+        render_transaction_block()
 
-        tx_box = st.container()
-        with tx_box:
-            col_tx1, col_tx2 = st.columns(2)
-            with col_tx1:
-                action = st.selectbox(
-                    "Action",
-                    ["Check In", "Check Out"],
-                    key=f"tx_action_{item_code}",
-                )
-            with col_tx2:
-                qty = st.number_input(
-                    "Quantity",
-                    min_value=1,
-                    step=1,
-                    key=f"tx_qty_{item_code}",
-                )
-
-            job = None
-            if action == "Check Out":
-                job = st.text_input(
-                    "Job / Project (optional)",
-                    key=f"tx_job_{item_code}",
-                )
-
-            st.markdown("")
-            if st.button("Apply Transaction", type="primary", key=f"tx_save_{item_code}"):
-                if action == "Check Out" and qty > qty_current:
-                    st.error("Cannot check out more items than are in stock.")
-                else:
-                    if action == "Check In":
-                        inventory[item_code]["quantity"] = qty_current + int(qty)
-                        save_inventory()
-                        record_transaction(item_code, "in", qty)
-                        st.success(f"Checked IN {qty} item(s).")
-                    else:
-                        inventory[item_code]["quantity"] = qty_current - int(qty)
-                        save_inventory()
-                        record_transaction(item_code, "out", qty, job)
-                        st.success(f"Checked OUT {qty} item(s).")
-
-                    st.rerun()
-
-    # ------------- History Tab -------------
+    # History tab
     with tab_hist:
         st.markdown("##### History")
         history = item.get("history", [])
@@ -287,11 +359,13 @@ def show_item_view(item_code: str, header_title: str):
                         "manual": "MANUAL",
                     }.get(entry.get("action"), entry.get("action", "").upper()),
                     "Qty": entry.get("qty", 0),
+                    "Person": entry.get("person", ""),
                     "Job": entry.get("job", ""),
+                    "Notes": entry.get("notes", ""),
                 })
             st.dataframe(rows, use_container_width=True)
 
-    # ------------- Edit Tab -------------
+    # Edit tab
     with tab_edit:
         st.markdown("##### Edit Item")
 
@@ -336,7 +410,7 @@ def show_item_view(item_code: str, header_title: str):
             if name_changed:
                 item["name"] = edit_name
 
-            # Quantity change
+            # Quantity change recorded as MANUAL
             if qty_changed:
                 diff = int(edit_qty) - qty_current
                 item["quantity"] = int(edit_qty)
@@ -346,7 +420,9 @@ def show_item_view(item_code: str, header_title: str):
                         new_code,
                         "manual",
                         abs(diff),
-                        job=f"Manual adjust from {qty_current} to {edit_qty}",
+                        person="ADMIN",
+                        job=None,
+                        notes=f"Manual adjust from {qty_current} to {edit_qty}",
                     )
 
             save_inventory()
@@ -361,7 +437,7 @@ def show_item_view(item_code: str, header_title: str):
 
             st.rerun()
 
-    # ------------- QR Tab -------------
+    # QR Code tab
     with tab_qr:
         st.markdown("##### QR Code")
 
@@ -417,16 +493,26 @@ if "code" in qp and qp["code"]:
     scanned_code = val[0] if isinstance(val, list) else val
 
 # Page state
-PAGES = ["Home", "Item", "Admin"]
+# If opened via QR scan: limit functionality (no Admin, item page = transaction only)
+if scanned_code:
+    PAGES = ["Item"]
+else:
+    PAGES = ["Home", "Item", "Admin"]
+
 if "page" not in st.session_state:
-    st.session_state["page"] = "Home"
+    st.session_state["page"] = "Home" if not scanned_code else "Item"
 
 # If opened via QR, default to Item page once
 if scanned_code and st.session_state.get("page_init_qr") is None:
     st.session_state["page"] = "Item"
     st.session_state["page_init_qr"] = True
 
-current_index = PAGES.index(st.session_state["page"])
+# Sync index
+current_page = st.session_state["page"]
+if current_page not in PAGES:
+    current_page = PAGES[0]
+current_index = PAGES.index(current_page)
+
 page = st.radio(
     "Page",
     PAGES,
@@ -437,31 +523,32 @@ page = st.radio(
 st.session_state["page"] = page
 
 # ----------------------
-# HOME PAGE
+# HOME PAGE (only when not scanned)
 # ----------------------
 if page == "Home":
     st.subheader("Overview")
 
-    st.markdown("#### Today's Excel Report")
-    today_report = get_today_report_path()
-    if os.path.exists(today_report):
-        with open(today_report, "rb") as f:
+    st.markdown("#### Excel Report")
+    report_path = get_report_path()
+    if os.path.exists(report_path):
+        with open(report_path, "rb") as f:
             st.download_button(
-                "Download Today's Report",
+                "Download Inventory Report",
                 data=f,
-                file_name=os.path.basename(today_report),
+                file_name=os.path.basename(report_path),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_report_home",
             )
     else:
-        st.caption("No transactions recorded today yet.")
+        st.caption("No transactions recorded yet.")
 
     st.markdown("#### Quick Guide")
     st.markdown(
         "- Use **Admin** to create items and generate QR labels.\n"
         "- Stick QR labels on shelves, bins, or tools.\n"
         "- Workers scan QR with phone camera to open the **Item** page.\n"
-        "- Use **Transaction** tab to check stock in or out.\n"
+        "- Use the transaction form to check stock in or out.\n"
+        "- All movements and overrides are logged into the Excel report.\n"
     )
 
 # ----------------------
@@ -471,19 +558,21 @@ elif page == "Item":
     st.subheader("Item")
 
     item_to_show = None
+    transactions_only = False
 
-    # QR-scan case
+    # QR-scan case: only allow transactions
     if scanned_code:
         if scanned_code in inventory:
             item_to_show = scanned_code
+            transactions_only = True
             st.caption(f"Loaded via QR code: `{scanned_code}`")
         else:
             st.error("Scanned item code not found in inventory.")
 
-    # Manual selection
+    # Manual selection (only when not scanned)
     if not scanned_code:
         if not inventory:
-            st.info("No items yet. Use Admin to add items.")
+            st.info("No items in inventory yet. Use Admin to add items.")
         else:
             st.markdown("#### Select Item")
             items = []
@@ -497,20 +586,21 @@ elif page == "Item":
             placeholder = "[Select item]"
             ui_options = [placeholder] + labels
 
-            selected_label = st.selectbox(
-                "",
-                ui_options,
-                index=0,
-            )
+            selected_label = st.selectbox("", ui_options, index=0)
 
             if selected_label != placeholder:
                 item_to_show = labels_by_code[selected_label]
+                transactions_only = False  # full view on computer/manual
 
     if item_to_show:
-        show_item_view(item_to_show, header_title="Item Overview")
+        show_item_view(
+            item_to_show,
+            header_title="Item Overview",
+            transactions_only=transactions_only,
+        )
 
 # ----------------------
-# ADMIN PAGE
+# ADMIN PAGE (only when not scanned)
 # ----------------------
 elif page == "Admin":
     st.subheader("Admin")
@@ -569,17 +659,17 @@ elif page == "Admin":
             st.code(qr_data, language="text")
 
     st.markdown("---")
-    st.markdown("#### Today's Excel Report")
+    st.markdown("#### Excel Report")
 
-    today_report = get_today_report_path()
-    if os.path.exists(today_report):
-        with open(today_report, "rb") as f:
+    report_path = get_report_path()
+    if os.path.exists(report_path):
+        with open(report_path, "rb") as f:
             st.download_button(
-                "Download Today's Report",
+                "Download Inventory Report",
                 data=f,
-                file_name=os.path.basename(today_report),
+                file_name=os.path.basename(report_path),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_report_admin",
             )
     else:
-        st.caption("No transactions recorded today yet.")
+        st.caption("No transactions recorded yet.")
