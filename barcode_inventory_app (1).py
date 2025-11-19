@@ -100,7 +100,7 @@ def show_item_detail(item_code: str, section_title: str = "Item Detail"):
                 record_transaction(item_code, "out", qty, job)
                 st.success(f"Checked OUT {qty} item(s).")
 
-            st.experimental_rerun()
+            st.rerun()
 
     # --- Transaction History ---
     st.write("### Transaction History")
